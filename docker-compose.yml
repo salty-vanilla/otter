@@ -1,0 +1,18 @@
+version: "3"
+
+services:
+  cuda:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+      - USERNAME=$USER
+      - UID=$UID
+      - GID=$GROUPS
+    volumes:
+      - .:/code:cached
+    env_file:
+      - .env
+    hostname: cuda
+    tty: true
+    command: sleep infinity
