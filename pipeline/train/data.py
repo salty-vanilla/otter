@@ -6,27 +6,33 @@ import logging
 import math
 import os
 import random
+import statistics
 import sys
-import yaml
 from dataclasses import dataclass
 from multiprocessing import Value
-import numpy as np
 
 import braceexpand
+import numpy as np
 import torch
 import torch.utils
 import torchvision
 import webdataset as wds
-from PIL import Image, ImageSequence, ImageFile
+import yaml
+from PIL import Image, ImageFile, ImageSequence
 from torch.utils.data import DataLoader, IterableDataset, RandomSampler, get_worker_info
 from torch.utils.data.distributed import DistributedSampler
 from webdataset.filters import _shuffle
-from webdataset.tariterators import base_plus_ext, tar_file_expander, url_opener, valid_sample
+from webdataset.tariterators import (
+    base_plus_ext,
+    tar_file_expander,
+    url_opener,
+    valid_sample,
+)
+
 from pipeline.mimicit_utils.mimicit_dataset import MimicitDataset
+from pipeline.mimicit_utils.mimicview_dataset import MimicViewDataset
 
 from .train_utils import DistributedProxySampler
-
-import statistics
 
 Image.MAX_IMAGE_PIXELS = 1000000000
 MAX_NUM_TOKENS = 256
@@ -67,7 +73,14 @@ def get_dataset_size(shards):
     len_filename = os.path.join(dir_path, "__len__")
     if os.path.exists(sizes_filename):
         sizes = json.load(open(sizes_filename, "r"))
-        total_size = sum([int(sizes[os.path.basename(shard)]) if os.path.basename(shard) in sizes else 0 for shard in shards_list])
+        total_size = sum(
+            [
+                int(sizes[os.path.basename(shard)])
+                if os.path.basename(shard) in sizes
+                else 0
+                for shard in shards_list
+            ]
+        )
     elif os.path.exists(len_filename):
         # FIXME this used to be eval(open(...)) but that seemed rather unsafe
         total_size = ast.literal_eval(open(len_filename, "r").read())
@@ -93,7 +106,9 @@ def count_samples(dataloader):
 
 
 def filter_no_caption_or_no_image(sample):
-    return ("txt" in sample) and ("png" in sample or "jpg" in sample or "jpeg" in sample)
+    return ("txt" in sample) and (
+        "png" in sample or "jpg" in sample or "jpeg" in sample
+    )
 
 
 def decode_base64_image(key, value):
@@ -115,13 +130,17 @@ def decode_base64_image(key, value):
 
 def log_and_continue(exn):
     """Call in an exception handler to ignore any exception, issue a warning, and continue."""
-    if "No images in sample" in str(exn) or "Only one image in sample" in str(exn):  # Avoid spamming logs with these
+    if "No images in sample" in str(exn) or "Only one image in sample" in str(
+        exn
+    ):  # Avoid spamming logs with these
         return True
     logging.warning(f"Handling webdataset error ({repr(exn)}). Ignoring.")
     return True
 
 
-def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None):
+def group_by_keys_nothrow(
+    data, keys=base_plus_ext, lcase=True, suffixes=None, handler=None
+):
     """Return function over iterator that groups key, value pairs into samples.
 
     :param keys: function that splits the key into key and extension (base_plus_ext)
@@ -139,7 +158,11 @@ def group_by_keys_nothrow(data, keys=base_plus_ext, lcase=True, suffixes=None, h
         # FIXME webdataset version throws if suffix in current_sample, but we have a potential for
         #  this happening in the current LAION400m dataset if a tar ends with same prefix as the next
         #  begins, rare, but can happen since prefix aren't unique across tar files in that dataset
-        if current_sample is None or prefix != current_sample["__key__"] or suffix in current_sample:
+        if (
+            current_sample is None
+            or prefix != current_sample["__key__"]
+            or suffix in current_sample
+        ):
             if valid_sample(current_sample):
                 yield current_sample
             current_sample = dict(__key__=prefix, __url__=filesample["__url__"])
@@ -259,7 +282,10 @@ class ResampledShards2(IterableDataset):
 def preprocess_image(sample, image_processor):
     # uuid_str = str(uuid.uuid4())
     # sample[0].save(f'./archived/images/{uuid_str}.png')
-    image = [image_processor.preprocess(s, return_tensors="pt")["pixel_values"] for s in sample]
+    image = [
+        image_processor.preprocess(s, return_tensors="pt")["pixel_values"]
+        for s in sample
+    ]
     image = torch.cat(image, dim=0)
     # apply random horizontal flip wo/w color jitter
     image = torchvision.transforms.RandomHorizontalFlip(p=0.5)(image)
@@ -273,9 +299,16 @@ B_INST, E_INST = "[INST]", "[/INST]"
 def preprocess_text(sample, tokenizer, prompt_format="simple"):
     tokenizer.padding_side = "right"
     if prompt_format == "simple":
-        sample = [(f"<image>{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample]
+        sample = [
+            (f"<image>{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample
+        ]
     elif prompt_format == "llama2_inst":
-        sample = [(f"<image>{B_INST}please describe this image.{E_INST}{s.strip()}<|endofchunk|>{tokenizer.eos_token}") for s in sample]
+        sample = [
+            (
+                f"<image>{B_INST}please describe this image.{E_INST}{s.strip()}<|endofchunk|>{tokenizer.eos_token}"
+            )
+            for s in sample
+        ]
     text = tokenizer(
         sample,
         max_length=32,
@@ -291,7 +324,9 @@ MAX_NUM_IMAGES = 5
 import base64
 
 
-def preprocess_interleaved(sample, tokenizer, clip_processor, sim_threshold, distributed_type="no"):
+def preprocess_interleaved(
+    sample, tokenizer, clip_processor, sim_threshold, distributed_type="no"
+):
     info = json.loads(sample[0])
     sentences = info["text_list"]
 
@@ -331,7 +366,9 @@ def preprocess_interleaved(sample, tokenizer, clip_processor, sim_threshold, dis
 
     # pad to 5 images
     if len(images_tensors) < MAX_NUM_IMAGES:
-        zero_padding = torch.zeros((MAX_NUM_IMAGES - len(images_tensors), 3, 224, 224), dtype=torch.float)
+        zero_padding = torch.zeros(
+            (MAX_NUM_IMAGES - len(images_tensors), 3, 224, 224), dtype=torch.float
+        )
         images_tensors = torch.cat((images_tensors, zero_padding), dim=0)
 
     # add in <image> and <eoc> tokens
@@ -342,17 +379,30 @@ def preprocess_interleaved(sample, tokenizer, clip_processor, sim_threshold, dis
     text = " ".join(sentences)
     text = text.replace("<|endofchunk|>", "", 1)  # but remove first eoc
     # whitespace cleanup
-    text = text.replace(" <|endofchunk|>", "<|endofchunk|>").replace("<image> ", "<image>").replace(" <image>", "<image>")
+    text = (
+        text.replace(" <|endofchunk|>", "<|endofchunk|>")
+        .replace("<image> ", "<image>")
+        .replace(" <image>", "<image>")
+    )
     text = f"{text}<|endofchunk|>{tokenizer.eos_token}"
     tokenizer.padding_side = "right"
-    text_tensor = tokenizer(text, max_length=256, truncation=True, padding="max_length", return_tensors="pt")
+    text_tensor = tokenizer(
+        text, max_length=256, truncation=True, padding="max_length", return_tensors="pt"
+    )
 
     # reject sequences with too few images (after truncation)
-    num_images = torch.count_nonzero(text_tensor["input_ids"] == tokenizer.additional_special_tokens_ids[tokenizer.additional_special_tokens.index("<image>")])
+    num_images = torch.count_nonzero(
+        text_tensor["input_ids"]
+        == tokenizer.additional_special_tokens_ids[
+            tokenizer.additional_special_tokens.index("<image>")
+        ]
+    )
 
     if num_images == 0:
         raise ValueError("No images in sample")
-    elif num_images == 1 and random.random() <= 0.5:  # 50% chance of keeping single image samples
+    elif (
+        num_images == 1 and random.random() <= 0.5
+    ):  # 50% chance of keeping single image samples
         raise ValueError("Only one image in sample")
 
     return (
@@ -379,7 +429,9 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # create a shared epoch store to sync epoch to dataloader worker proc
     shared_epoch = SharedEpoch(epoch=epoch)
     if resampled:
-        pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
+        pipeline = [
+            ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)
+        ]
     else:
         pipeline = [wds.SimpleShardList(input_shards)]
 
@@ -426,7 +478,9 @@ def get_mmc4_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
 
     dataset = wds.DataPipeline(*pipeline)
     if not resampled:
-        assert num_shards >= args.workers * args.world_size, "number of shards must be >= total workers"
+        assert (
+            num_shards >= args.workers * args.world_size
+        ), "number of shards must be >= total workers"
     # roll over and repeat a few samples to get same number of full batches on each node
     round_fn = math.floor if floor else math.ceil
     global_batch_size = args.batch_size_mmc4 * args.world_size
@@ -471,12 +525,16 @@ def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # create a shared epoch store to sync epoch to dataloader worker proc
     shared_epoch = SharedEpoch(epoch=epoch)
     if resampled:
-        pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
+        pipeline = [
+            ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)
+        ]
     else:
         pipeline = [wds.SimpleShardList(input_shards)]
 
     # create two preprocess functions that take in the passed in image_processor and tokenizer
-    preprocess_image_fn = functools.partial(preprocess_image, image_processor=image_processor)
+    preprocess_image_fn = functools.partial(
+        preprocess_image, image_processor=image_processor
+    )
     preprocess_text_fn = functools.partial(preprocess_text, tokenizer=tokenizer)
 
     # at this point we have an iterator over all the shards
@@ -511,13 +569,17 @@ def get_laion_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
             wds.decode(decode_base64_image, only="png", handler=log_and_continue),
             wds.to_tuple("jpg;png;jpeg", "txt", handler=log_and_continue),
             wds.batched(args.batch_size_laion, partial=False),
-            wds.map_tuple(preprocess_image_fn, preprocess_text_fn, handler=log_and_continue),
+            wds.map_tuple(
+                preprocess_image_fn, preprocess_text_fn, handler=log_and_continue
+            ),
         ]
     )
 
     dataset = wds.DataPipeline(*pipeline)
     if not resampled:
-        assert num_shards >= args.workers * args.world_size, "number of shards must be >= total workers"
+        assert (
+            num_shards >= args.workers * args.world_size
+        ), "number of shards must be >= total workers"
     # roll over and repeat a few samples to get same number of full batches on each node
     round_fn = math.floor if floor else math.ceil
     global_batch_size = args.batch_size_laion * args.world_size
@@ -562,12 +624,16 @@ def get_cc3m_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # create a shared epoch store to sync epoch to dataloader worker proc
     shared_epoch = SharedEpoch(epoch=epoch)
     if resampled:
-        pipeline = [ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)]
+        pipeline = [
+            ResampledShards2(input_shards, deterministic=True, epoch=shared_epoch)
+        ]
     else:
         pipeline = [wds.SimpleShardList(input_shards)]
 
     # create two preprocess functions that take in the passed in image_processor and tokenizer
-    preprocess_image_fn = functools.partial(preprocess_image, image_processor=image_processor)
+    preprocess_image_fn = functools.partial(
+        preprocess_image, image_processor=image_processor
+    )
     preprocess_text_fn = functools.partial(preprocess_text, tokenizer=tokenizer)
 
     # at this point we have an iterator over all the shards
@@ -602,13 +668,17 @@ def get_cc3m_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
             wds.decode("pil", handler=log_and_continue),
             wds.to_tuple("jpg;png;jpeg", "txt", handler=log_and_continue),
             wds.batched(args.batch_size_cc3m, partial=False),
-            wds.map_tuple(preprocess_image_fn, preprocess_text_fn, handler=log_and_continue),
+            wds.map_tuple(
+                preprocess_image_fn, preprocess_text_fn, handler=log_and_continue
+            ),
         ]
     )
 
     dataset = wds.DataPipeline(*pipeline)
     if not resampled:
-        assert num_shards >= args.workers * args.world_size, "number of shards must be >= total workers"
+        assert (
+            num_shards >= args.workers * args.world_size
+        ), "number of shards must be >= total workers"
     # roll over and repeat a few samples to get same number of full batches on each node
     round_fn = math.floor if floor else math.ceil
     global_batch_size = args.batch_size_cc3m * args.world_size
@@ -663,37 +733,66 @@ def get_mimicit_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # processing for image-text in-context datasets
     if args.mimicit_ic_path != "":
         all_mimicit_ic_path = (
-            args.mimicit_ic_path.split(",") + args.past_mimicit_ic_path.split(",") if args.past_mimicit_ic_path != "" else args.mimicit_ic_path.split(",")
+            args.mimicit_ic_path.split(",") + args.past_mimicit_ic_path.split(",")
+            if args.past_mimicit_ic_path != ""
+            else args.mimicit_ic_path.split(",")
         )
         all_images_ic_path = (
-            args.images_ic_path.split(",") + args.past_images_ic_path.split(",") if args.past_images_ic_path != "" else args.images_ic_path.split(",")
+            args.images_ic_path.split(",") + args.past_images_ic_path.split(",")
+            if args.past_images_ic_path != ""
+            else args.images_ic_path.split(",")
         )
         all_train_config_ic_path = (
-            args.train_config_ic_path.split(",") + args.past_train_config_ic_path.split(",")
+            args.train_config_ic_path.split(",")
+            + args.past_train_config_ic_path.split(",")
             if args.past_train_config_ic_path != ""
             else args.train_config_ic_path.split(",")
         )
         if args.past_mimicit_ic_path != "":
-            ic_status = ["new"] * len(args.mimicit_ic_path.split(",")) + ["past"] * len(args.past_mimicit_ic_path.split(","))
+            ic_status = ["new"] * len(args.mimicit_ic_path.split(",")) + ["past"] * len(
+                args.past_mimicit_ic_path.split(",")
+            )
         else:
             ic_status = ["new"] * len(args.mimicit_ic_path.split(","))
-        unified_dataset = MimicitDataset(args, all_mimicit_ic_path, all_images_ic_path, all_train_config_ic_path, status_list=ic_status)
+        unified_dataset = MimicitDataset(
+            args,
+            all_mimicit_ic_path,
+            all_images_ic_path,
+            all_train_config_ic_path,
+            status_list=ic_status,
+        )
         unified_datasets.append(unified_dataset)
 
     # processing for image-text datasets
     if args.mimicit_path != "":
-        all_mimicit_path = args.mimicit_path.split(",") + args.past_mimicit_path.split(",") if args.past_mimicit_path != "" else args.mimicit_path.split(",")
-        all_images_path = args.images_path.split(",") + args.past_images_path.split(",") if args.past_images_path != "" else args.images_path.split(",")
+        all_mimicit_path = (
+            args.mimicit_path.split(",") + args.past_mimicit_path.split(",")
+            if args.past_mimicit_path != ""
+            else args.mimicit_path.split(",")
+        )
+        all_images_path = (
+            args.images_path.split(",") + args.past_images_path.split(",")
+            if args.past_images_path != ""
+            else args.images_path.split(",")
+        )
         all_train_config_path = (
             args.train_config_path.split(",") + args.past_train_config_path.split(",")
             if args.past_train_config_path != ""
             else args.train_config_path.split(",")
         )
         if args.past_mimicit_path != "":
-            status = ["new"] * len(args.mimicit_path.split(",")) + ["past"] * len(args.past_mimicit_path.split(","))
+            status = ["new"] * len(args.mimicit_path.split(",")) + ["past"] * len(
+                args.past_mimicit_path.split(",")
+            )
         else:
             status = ["new"] * len(args.mimicit_path.split(","))
-        unified_dataset = MimicitDataset(args, all_mimicit_path, all_images_path, all_train_config_path, status_list=status)
+        unified_dataset = MimicitDataset(
+            args,
+            all_mimicit_path,
+            all_images_path,
+            all_train_config_path,
+            status_list=status,
+        )
         unified_datasets.append(unified_dataset)
 
     # processing for text datasets
@@ -704,38 +803,58 @@ def get_mimicit_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
             else args.mimicit_text_path.split(",")
         )
         all_train_config_text_path = (
-            args.train_config_text_path.split(",") + args.past_train_config_text_path.split(",")
+            args.train_config_text_path.split(",")
+            + args.past_train_config_text_path.split(",")
             if args.past_train_config_text_path != ""
             else args.train_config_text_path.split(",")
         )
 
         if args.past_mimicit_text_path != "":
-            text_status = ["new"] * len(args.mimicit_text_path.split(",")) + ["past"] * len(args.past_mimicit_text_path.split(","))
+            text_status = ["new"] * len(args.mimicit_text_path.split(",")) + [
+                "past"
+            ] * len(args.past_mimicit_text_path.split(","))
         else:
             text_status = ["new"] * len(args.mimicit_text_path.split(","))
-        unified_dataset = MimicitDataset(args, all_mimicit_text_path, all_train_config_text_path, status_list=text_status)
+        unified_dataset = MimicitDataset(
+            args,
+            all_mimicit_text_path,
+            all_train_config_text_path,
+            status_list=text_status,
+        )
         unified_datasets.append(unified_dataset)
 
     # processing for video-text datasets
     if args.mimicit_vt_path != "":
         all_mimicit_vt_path = (
-            args.mimicit_vt_path.split(",") + args.past_mimicit_vt_path.split(",") if args.past_mimicit_vt_path != "" else args.mimicit_vt_path.split(",")
+            args.mimicit_vt_path.split(",") + args.past_mimicit_vt_path.split(",")
+            if args.past_mimicit_vt_path != ""
+            else args.mimicit_vt_path.split(",")
         )
         all_images_vt_path = (
-            args.images_vt_path.split(",") + args.past_images_vt_path.split(",") if args.past_images_vt_path != "" else args.images_vt_path.split(",")
+            args.images_vt_path.split(",") + args.past_images_vt_path.split(",")
+            if args.past_images_vt_path != ""
+            else args.images_vt_path.split(",")
         )
         if args.past_mimicit_vt_path != "":
-            vt_status = ["new"] * len(args.mimicit_vt_path.split(",")) + ["past"] * len(args.past_mimicit_vt_path.split(","))
+            vt_status = ["new"] * len(args.mimicit_vt_path.split(",")) + ["past"] * len(
+                args.past_mimicit_vt_path.split(",")
+            )
         else:
             vt_status = ["new"] * len(args.mimicit_vt_path.split(","))
-        unified_dataset = MimicitDataset(args, all_mimicit_vt_path, all_images_vt_path, status_list=vt_status)
+        unified_dataset = MimicitDataset(
+            args, all_mimicit_vt_path, all_images_vt_path, status_list=vt_status
+        )
         unified_datasets.append(unified_dataset)
 
     # args.train_num_samples = sum(len(dataset) for dataset in unified_datasets) / len(unified_datasets)
     if args.train_num_samples == -1:
-        args.train_num_samples = statistics.median((len(dataset) for dataset in unified_datasets))
+        args.train_num_samples = statistics.median(
+            (len(dataset) for dataset in unified_datasets)
+        )
 
-    assert args.train_num_samples <= max([len(dataset) for dataset in unified_datasets]), "your train_num_samples is larger than dataset"
+    assert args.train_num_samples <= max(
+        [len(dataset) for dataset in unified_datasets]
+    ), "your train_num_samples is larger than dataset"
 
     round_fn = math.floor if floor else math.ceil
     global_batch_size = args.batch_size * args.world_size
@@ -752,9 +871,13 @@ def get_mimicit_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     # unified_datasets = unified_old_datasets + unified_new_datasets
 
     for unified_dataset in unified_datasets:
-        sampler = RandomSampler(unified_dataset, replacement=True, num_samples=num_samples)
+        sampler = RandomSampler(
+            unified_dataset, replacement=True, num_samples=num_samples
+        )
         if args.distributed_type == "DEEPSPEED" or args.distributed_type == "MULTI_GPU":
-            sampler = DistributedProxySampler(sampler, num_replicas=args.world_size, rank=args.rank)
+            sampler = DistributedProxySampler(
+                sampler, num_replicas=args.world_size, rank=args.rank
+            )
         dataloader = torch.utils.data.DataLoader(
             unified_dataset,
             sampler=sampler,
@@ -769,6 +892,135 @@ def get_mimicit_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
     return dataloaders
 
 
+def get_mimicview_dataset(args, image_processor, tokenizer, epoch=0, floor=False):
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    args.task = "pretrain"
+    args.tokenizer = tokenizer
+    # print(f'tokenizer: {tokenizer}')
+    unified_datasets = []
+    val_unified_datasets = []
+    # processing for image-text in-context datasets
+    if args.mimicit_ic_path != "":
+        all_mimicit_ic_path = args.mimicit_ic_path.split(",")
+        all_images_ic_path = args.images_ic_path.split(",")
+        all_train_config_ic_path = args.train_config_ic_path.split(",")
+        ic_status = ["new"] * len(args.mimicit_ic_path.split(","))
+        unified_dataset = MimicViewDataset(
+            args,
+            all_mimicit_ic_path,
+            all_images_ic_path,
+            all_train_config_ic_path,
+            status_list=ic_status,
+        )
+        unified_datasets.append(unified_dataset)
+
+        if args.val_mimicit_ic_path != "":
+            all_val_mimicit_ic_path = args.val_mimicit_ic_path.split(",")
+            all_val_images_ic_path = args.val_images_ic_path.split(",")
+            all_val_config_ic_path = args.val_config_ic_path.split(",")
+            val_unified_dataset = MimicViewDataset(
+                args,
+                all_val_mimicit_ic_path,
+                all_val_images_ic_path,
+                all_val_config_ic_path,
+                status_list=ic_status,
+            )
+            val_unified_datasets.append(val_unified_dataset)
+
+    # args.train_num_samples = sum(len(dataset) for dataset in unified_datasets) / len(unified_datasets)
+    if args.train_num_samples == -1:
+        args.train_num_samples = statistics.median(
+            (len(dataset) for dataset in unified_datasets)
+        )
+    if args.val_num_samples == -1:
+        args.val_num_samples = statistics.median(
+            (len(dataset) for dataset in val_unified_datasets)
+        )
+
+    assert args.train_num_samples <= max(
+        [len(dataset) for dataset in unified_datasets]
+    ), "your train_num_samples is larger than dataset"
+    assert args.val_num_samples <= max(
+        [len(dataset) for dataset in val_unified_datasets]
+    ), "your train_num_samples is larger than dataset"
+
+    round_fn = math.floor if floor else math.ceil
+    global_batch_size = args.batch_size * args.world_size
+
+    num_samples = args.train_num_samples  # 8
+    val_num_samples = args.val_num_samples  # 8
+    num_batches = round_fn(num_samples / global_batch_size)  # 2
+    num_val_batches = round_fn(val_num_samples / global_batch_size)  # 2
+    num_samples = num_batches * global_batch_size  # 8
+    val_num_samples = num_val_batches * global_batch_size  # 8
+    dataloaders = []
+    val_dataloaders = []
+
+    for unified_dataset in unified_datasets:
+        if len(unified_datasets) == 1:
+            sampler = RandomSampler(
+                unified_dataset, replacement=False, num_samples=len(unified_dataset)
+            )
+        else:
+            if "replacement-true" not in args.run_name:
+                sampler = RandomSampler(
+                    unified_dataset, replacement=False, num_samples=len(unified_dataset)
+                )
+            else:
+                sampler = RandomSampler(
+                    unified_dataset, replacement=True, num_samples=num_samples
+                )
+        if args.distributed_type == "DEEPSPEED" or args.distributed_type == "MULTI_GPU":
+            sampler = DistributedProxySampler(
+                sampler, num_replicas=args.world_size, rank=args.rank
+            )
+        dataloader = torch.utils.data.DataLoader(
+            unified_dataset,
+            sampler=sampler,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=unified_dataset.collate,
+        )
+
+        dataloaders.append(dataloader)
+    for val_unified_dataset in val_unified_datasets:
+        if len(val_unified_datasets) == 1:
+            sampler = RandomSampler(
+                val_unified_dataset,
+                replacement=False,
+                num_samples=len(val_unified_dataset),
+            )
+        else:
+            if "replacement-true" not in args.run_name:
+                sampler = RandomSampler(
+                    val_unified_dataset,
+                    replacement=False,
+                    num_samples=len(val_unified_dataset),
+                )
+            else:
+                sampler = RandomSampler(
+                    val_unified_dataset, replacement=True, num_samples=num_samples
+                )
+        if args.distributed_type == "DEEPSPEED" or args.distributed_type == "MULTI_GPU":
+            sampler = DistributedProxySampler(
+                sampler, num_replicas=args.world_size, rank=args.rank
+            )
+        dataloader = torch.utils.data.DataLoader(
+            val_unified_dataset,
+            sampler=sampler,
+            batch_size=args.batch_size,
+            num_workers=args.workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=unified_dataset.collate,
+        )
+
+        val_dataloaders.append(dataloader)
+    return dataloaders, val_dataloaders
+
+
 def get_dataset_fn(dataset_type):
     if dataset_type == "laion":
         return get_laion_dataset
@@ -778,9 +1030,13 @@ def get_dataset_fn(dataset_type):
         return get_mimicit_dataset
     elif dataset_type == "cc3m":
         return get_cc3m_dataset
+    elif dataset_type == "mimicview":
+        return get_mimicview_dataset
     else:
         raise ValueError(f"Unsupported dataset type: {dataset_type}")
 
 
 def get_data(args, image_processor, tokenizer, dataset_type, epoch=0):
-    return get_dataset_fn(dataset_type)(args, image_processor=image_processor, epoch=epoch, tokenizer=tokenizer)
+    return get_dataset_fn(dataset_type)(
+        args, image_processor=image_processor, epoch=epoch, tokenizer=tokenizer
+    )

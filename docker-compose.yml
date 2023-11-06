@@ -11,6 +11,7 @@ services:
       - GID=$GROUPS
     volumes:
       - .:/code:cached
+      - ${DATASET_DIR}:/dataset
     env_file:
       - .env
     hostname: cuda
